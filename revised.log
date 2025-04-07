@@ -1,0 +1,12 @@
+INFO:     Started server process [1595222]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:36242 - "GET /404 HTTP/1.1" 404 Not Found
+ERROR:    Unexpected Error!!!
+INFO:     127.0.0.1:36258 - "GET /500 HTTP/1.1" 500 Internal Server Error
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [1595222]
+
