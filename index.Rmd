@@ -1,0 +1,132 @@
+---
+title: "FastAPIのエラーハンドリングの基本と、ハンドリング漏れ対策"
+output:
+  md_document:
+    variant: commonmark
+    pandoc_args: ["--wrap=none"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(python.reticulate = FALSE)
+projroot <- rprojroot::find_root(rprojroot::is_git_root)
+cwd <- fs::path_rel(normalizePath(getwd()), projroot)
+demo_dir <- fs::path(cwd, "assets/demo")
+fs::dir_exists(demo_dir)
+```
+
+APIサーバーの実装では、プログラムエラーをハンドリングして、クライアントエラーやサーバーエラーを適切にレスポンスすることが求められます。
+同時に、エラーに関するログを出力することも重要です。
+
+PythonのWebフレームワークである[FastAPI](https://fastapi.tiangolo.com/ja/)にも、このような需要エラーハンドリングの仕組みが用意されています。
+基本的には公式ドキュメントに従って、例外ハンドラを追加すればいいのですが、ハンドリング漏れした`Exception`のログを残すような用途に例外ハンドラは不適です。
+
+そこで、この記事では以下の3点について紹介します。
+
+- FastAPIのエラーハンドリングの基本
+- 例外ハンドラが`Exception`のハンドリングに不適な理由
+- `Exception`をハンドリングするためのミドルウェアの実装方法
+
+なお、本記事で利用したコードはGitHubのリポジトリに公開しています。
+
+<https://github.com/atusy/fastapi-error-handling-demo>
+
+## カスタム例外ハンドラによる一般的な例外のハンドリング
+
+基本的な方法について、詳しくは日本語の公式ドキュメントを参照してください。
+ここでは簡単に紹介します。
+
+> FastAPI > 学習 > チュートリアル - ユーザーガイド > エラーハンドリング \
+> <https://fastapi.tiangolo.com/ja/tutorial/handling-errors/>
+
+ドキュメントでは例外の扱いかたとして、主に2つの方法を説明しています。
+
+* HTTPレスポンスをエラーでクライアントに返すには、`raise HTTPException(...)`する
+* 特定のエラーを所定のHTTPレスポンスに自動変換するには、`@app.exception_handler(...)`でカスタム例外ハンドラを追加する
+    * `HTTPException`についても、FastAPIが組込みの例外ハンドラを使ってHTTPレスポンスに変換しているので、エラーハンドリングの本質は例外ハンドラと言えます（筆者補足）
+
+カスタム例外ハンドラは、FastAPIに組込みのハンドラを上書きして独自のレスポンスに統一したい場合や（[デフォルトの例外ハンドラのオーバーライド](https://fastapi.tiangolo.com/ja/tutorial/handling-errors/#_6)）、依存パッケージ由来の例外をハンドリングしたい場合に便利です。
+後者の例として、Google Cloud SDKでService Unavailableが発生した場合に、エラーログとともに503 Service Unavailableを返すような実装が考えられます。
+
+```python
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+from google.api_core.exceptions import GoogleAPIError, ServiceUnavailable
+
+@app.exception_handler(GoogleAPIError)
+async def handle_http_exception(__: Request, exc: GoogleAPIError) -> Response:
+    if isinstance(exc, ServiceUnavailable):
+        logger.exception("Google Cloud is Service Unavailable")
+        return JSONResponse(
+            content={"message": "Service Unavailable"},
+            status_code=503,
+        )
+    raise exc # 未処理のエラーをraiseしておくとFastAPIが500にしてくれる
+```
+
+カスタム例外ハンドラでハンドリングしたエラーは例外が抑制されます。
+
+ただし、基底クラスの`Exception`だけは例外で、未知のエラーを例外ハンドラーによってInternal Server Errorとしてサーバーエラーレスポンスに変換してもなお、例外が発生します。
+プログラム自体は継続するものの、生のトレースバックがログに出力されます。
+サーバーエラーのログを自前で出力している場合は、エラーログが2重になって冗長になります。
+特に構造化ログを採用している場合に構造化されていないエラーログが混ざるので更に不便です。
+
+例外ハンドラの結果を無視して例外を`raise`する挙動はFastAPIが依存するStarleeteの仕様です。
+`starlette.middleware.errors.ServerErrorMiddleware`のソースコードにその意図が記述されています。
+
+>
+    ```
+    # We always continue to raise the exception.
+    # This allows servers to log the error, or allows test clients
+    # to optionally raise the error within the test case.
+    ```
+> <https://github.com/encode/starlette/blob/c8a46925366361e40b65b117473db1342895b904/starlette/middleware/errors.py?plain=1#L184-L186>
+
+実際に、`Exception`を例外ハンドラで扱った場合のログがどうなるか、試してみましょう。
+検証に使ったソースコードは以下にあります。
+FastAPIが依存しているStarletteのバージョンについては0.45.3で固定しています。
+記事執筆の2025-04-07時点で最新の0.46.1にすると、バグの関係で今回紹介するコードで別の例外が発生するのでご注意ください。
+
+<https://github.com/atusy/fastapi-error-handling-demo>
+
+たとえば、以下のコードでは、`HTTPException`と`Exception`のハンドラーを設定しています。
+`GET /404`すると、`HTTPException`が発生し、`GET /500`すると、`Exception`が発生しますが、ハンドラがあるので、どちらもエラーが抑制されると期待したいところです。
+ところが実際には`GET /500`でエラーが発生していることをサーバーログから確認できます。
+
+```{python, eval=FALSE, code=readLines("main.py")}
+```
+
+<details><summary>`GET /404`と`GET /500`した時のサーバーログ</summary>
+
+```{r, echo=FALSE, comment=""}
+cat(readLines("main.log"), sep = "\n")
+```
+
+</details>
+
+## ミドルウェアによる`Exception`のハンドリング
+
+カスタム例外ハンドラで`Exception`を処理すると、ログの観点で都合が悪いことを確認しました。
+これがFastAPIおよびStarletteの仕様である以上、`Exception`に関しては`＠app.exception_handler(Exception)`でハンドリングせず、`ServerErrorMiddleware`の代替となるミドルウェアを実装するとよさそうです。
+Internal Server Errorを発生させている状況はエラーハンドリングできていないと見做せば、`@app.exception_handler(Exception)`せずに、このようなミドルウェアを実装することは妥当そうに思えます。
+
+そこで、プログラムに以下のような修正を加えます。
+
+```{bash, error=TRUE, class.output="diff", comment=""}
+diff -u main.py revised.py
+```
+
+この状態で`GET /404`と`GET /500`した時のサーバーログを見てみると、Internal Server Error発生時のトレースバックが消滅し、エラーログが開発者側で`logger.exception(...)`を使って出したものだけになりました。
+
+```{r, echo=FALSE, comment=""}
+cat(readLines("revised.log"), sep = "\n")
+```
+
+## おわりに
+
+FastAPIのカスタム例外ハンドラは、依存パッケージなどに由来する既知の例外の処理に便利ですが、処理基底クラスのExceptionをハンドリングしてログを残す場合はミドルウェアを実装する必要があることを確認しました。
+また、その理由がFastAPIが依存しているStarletteの仕様であることも確認しました。
+FastAPIの実装はStarletteに強く依存しているので、なにか問題があるときは、FastAPIに限らずStarletteのソースコードを確認することが重要そうです。
+
+
+
+
